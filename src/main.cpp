@@ -88,6 +88,44 @@ void clearClientIdFromNvs() {
 // LoRa 接收行缓冲，handleLoraInput 按字节追加，遇到 '\n' 即视为一帧结束。
 String loraLine;
 
+// ===== 步骤 7：SUBMIT/ACK 相关全局状态 =====
+
+// 设计文档第 8 节定义的可靠性参数：
+// 首次发送随机退避 0~300ms，未收 ACK 后等 300~1200ms 重发，最多重发 5 次。
+constexpr unsigned long SUBMIT_INITIAL_BACKOFF_MAX_MS = 300;
+constexpr unsigned long SUBMIT_RETRY_BACKOFF_MIN_MS = 300;
+constexpr unsigned long SUBMIT_RETRY_BACKOFF_MAX_MS = 1200;
+constexpr uint8_t SUBMIT_MAX_RETRIES = 5;
+
+// 本机递增的 msgId 计数器。
+// 设计成 unsigned long，单调递增；重启后从 1 开始（不持久化）。
+// 第一版重启会丢失 msgId 历史，可能与服务端之前见过的 msgId 撞号，
+// 但服务端去重以 (deviceId, roundId, msgId) 三元组为键，重启后 roundId 大概率已经推进，
+// 即使 roundId 没变，msgId=1 的"新"提交也只会因为 roundSubmissions[slot].submitted 为 true
+// 而被服务端返回 ERR_ALREADY_SUBMITTED，不会误计分。
+unsigned long localMsgId = 0;
+
+// 最近一次从服务端 STATUS 帧读到的 roundId。0 表示尚未收到任何 STATUS。
+// 在没拿到这个值之前不允许提交（避免拿默认值乱猜导致 ERR_BAD_ROUND）。
+unsigned long currentServerRoundId = 0;
+
+// 本轮是否已被服务端确认（收到过 OK / OK_DUPLICATE / ERR_ALREADY_SUBMITTED 之一）。
+// 锁定后再触发 submit 命令会被拒，必须等服务端推进到下一轮（STATUS 带新 roundId）才解锁。
+bool lockedForCurrentRound = false;
+unsigned long lockedRoundId = 0;
+
+// 当前是否有挂起的 SUBMIT 在等 ACK / 等重传。
+// pendingMsgId == 0 表示没有挂起；非 0 表示对应这次提交还没收到 ACK。
+unsigned long pendingMsgId = 0;
+unsigned long pendingRoundId = 0;
+int pendingRed = 0;
+int pendingBlue = 0;
+uint8_t pendingRetries = 0;          // 已经发送了几次（首发 +1，重发 +1...）
+unsigned long pendingNextSendMs = 0; // 下一次重发的 millis() 时刻
+
+// 串口命令行缓冲。客户端串口命令暂时只用于模拟按键提交（按键属步骤 9）。
+String serialLine;
+
 // 等待 E22 进入空闲状态再发送，避免在模块忙时数据被吞掉。
 // E22 的 AUX：HIGH=空闲可发送，LOW=正在收发或初始化。
 // 1 秒超时是兜底，防止 AUX 接线错误（悬空或始终被拉低）让程序永久卡死。
@@ -109,6 +147,8 @@ void sendLoraLine(const String& text) {
 
 // 组装并发送一帧 HELLO，告诉服务端本机存在以及当前绑定状态。
 // 帧格式：HELLO,deviceId,currentClientId,battMv,crc16（CRC 由 buildFrame 自动追加）。
+// HELLO 语义：上电/重连时的一次性自报，不是周期保活。
+// 周期保活由 sendHeartbeat 负责（10s/15s 间隔，详见设计文档第 9 节）。
 // deviceId / currentClientId 来自全局变量；battMv 仍为联通测试用常量，等 ADC 接入后再换成真值。
 void sendHello() {
     String fields[] = {
@@ -119,6 +159,38 @@ void sendHello() {
     };
 
     sendLoraLine(ScoreProtocol::buildFrame(fields, 4));
+}
+
+// 本机递增的 HEARTBEAT msgId 计数器，每次 sendHeartbeat 自增。
+// 与 SUBMIT 的 localMsgId 完全独立——SUBMIT 的 msgId 用于服务端的 (deviceId, roundId, msgId)
+// 去重；HEARTBEAT 的 msgId 当前只是为了让协议字段齐整、便于服务端日志区分包序，不参与去重。
+unsigned long localHeartbeatMsgId = 0;
+
+// 最近一次发 HEARTBEAT 的 millis() 时刻。
+// 在 loop 中按周期触发，也可被 handleAssign/handleUnbind 拨回（设为 0 等价于"上次很久以前"），
+// 让状态变化后能尽快发一帧 HEARTBEAT、拿回 STATUS 同步轮次。
+unsigned long lastHeartbeatMs = 0;
+
+// 触发下一次心跳尽快发送。
+// 在绑定状态变化（ASSIGN/UNBIND 成功）后调用，避免客户端要等满 10s 才能拿到 STATUS。
+void scheduleHeartbeatSoon() {
+    lastHeartbeatMs = 0;
+}
+
+// 组装并发送一帧 HEARTBEAT。
+// 帧格式：HEARTBEAT,deviceId,currentClientId,battMv,msgId,crc16（设计文档第 6 节）。
+// 周期由 loop 中的定时器控制，频率：未锁定 10s、已锁定 15s。
+void sendHeartbeat() {
+    localHeartbeatMsgId++;
+    String fields[] = {
+        "HEARTBEAT",
+        deviceId,
+        currentClientId,
+        String(TEST_BATTERY_MV),
+        String(localHeartbeatMsgId)
+    };
+
+    sendLoraLine(ScoreProtocol::buildFrame(fields, 5));
 }
 
 // 把已成功解析的协议帧打印到调试串口，便于联通测试时观察字段内容。
@@ -169,6 +241,87 @@ void sendUnbindAck() {
     sendLoraLine(ScoreProtocol::buildFrame(fields, 2));
 }
 
+// 组装并发送一帧 SUBMIT。
+// 帧格式：SUBMIT,deviceId,clientId,roundId,msgId,red,blue,battMv,crc16。
+// 调用方负责保证 pendingMsgId/pendingRoundId/pendingRed/pendingBlue 已被填好。
+// battMv 暂用联通测试常量，等步骤 10 ADC 接入后换成真值。
+void sendSubmit() {
+    String fields[] = {
+        "SUBMIT",
+        deviceId,
+        currentClientId,
+        String(pendingRoundId),
+        String(pendingMsgId),
+        String(pendingRed),
+        String(pendingBlue),
+        String(TEST_BATTERY_MV)
+    };
+    sendLoraLine(ScoreProtocol::buildFrame(fields, 8));
+}
+
+// 清掉挂起的提交状态。
+// 用于 ACK 到达成功匹配、或重传次数耗尽、或显式取消时。
+void clearPendingSubmit() {
+    pendingMsgId = 0;
+    pendingRoundId = 0;
+    pendingRed = 0;
+    pendingBlue = 0;
+    pendingRetries = 0;
+    pendingNextSendMs = 0;
+}
+
+// 在 loop() 中按时机驱动 SUBMIT 重传。
+// 行为：
+//   - pendingMsgId == 0 → 没有挂起的提交，直接返回。
+//   - 还没到 pendingNextSendMs → 等待。
+//   - 已达 SUBMIT_MAX_RETRIES → 放弃，清挂起，打错误日志。
+//   - 否则：发一帧 SUBMIT、retries++、安排下一次重发时刻（随机 300~1200ms）。
+// 非阻塞，不能 delay，否则会丢 LoRa 接收。
+void drivePendingSubmit() {
+    if (pendingMsgId == 0) {
+        return;
+    }
+    if (static_cast<long>(millis() - pendingNextSendMs) < 0) {
+        return;
+    }
+    if (pendingRetries >= SUBMIT_MAX_RETRIES) {
+        Serial.print("SUBMIT: gave up after ");
+        Serial.print(pendingRetries);
+        Serial.print(" attempts, msgId=");
+        Serial.println(pendingMsgId);
+        clearPendingSubmit();
+        return;
+    }
+
+    sendSubmit();
+    pendingRetries++;
+    const unsigned long backoff = SUBMIT_RETRY_BACKOFF_MIN_MS +
+        random(SUBMIT_RETRY_BACKOFF_MAX_MS - SUBMIT_RETRY_BACKOFF_MIN_MS + 1);
+    pendingNextSendMs = millis() + backoff;
+
+    Serial.print("SUBMIT attempt ");
+    Serial.print(pendingRetries);
+    Serial.print("/");
+    Serial.print(SUBMIT_MAX_RETRIES);
+    Serial.print(", next retry in ");
+    Serial.print(backoff);
+    Serial.println("ms");
+}
+
+// 检查 currentServerRoundId 是否已经超过 lockedRoundId，是则解锁本轮锁定。
+// 每次从 STATUS 帧更新 currentServerRoundId 后调用。
+void maybeUnlockOnRoundChange() {
+    if (lockedForCurrentRound && lockedRoundId != currentServerRoundId) {
+        Serial.print("Round changed (locked=");
+        Serial.print(lockedRoundId);
+        Serial.print(", current=");
+        Serial.print(currentServerRoundId);
+        Serial.println("), unlocked");
+        lockedForCurrentRound = false;
+        lockedRoundId = 0;
+    }
+}
+
 // 处理收到的 ASSIGN 帧。
 // 帧格式：ASSIGN,deviceId,clientId,crc16，fieldCount 必须为 3。
 // frame：parseFrame 已成功解析的帧。
@@ -208,6 +361,9 @@ void handleAssign(const ScoreProtocol::ParsedFrame& frame) {
     Serial.print("ASSIGN: bound as ");
     Serial.println(targetClient);
     sendAssignAck(targetClient);
+    // 绑定关系变更后尽快发心跳，让服务端回 STATUS、客户端尽早拿到 currentServerRoundId，
+    // 否则会有 ~10s 窗口期内无法通过 submit 命令。
+    scheduleHeartbeatSoon();
 }
 
 // 处理收到的 UNBIND 帧。
@@ -237,6 +393,97 @@ void handleUnbind(const ScoreProtocol::ParsedFrame& frame) {
     clearClientIdFromNvs();
     Serial.println("UNBIND: cleared local binding");
     sendUnbindAck();
+    // 绑定关系变更后尽快发心跳，让服务端尽早把这台设备登记回未绑定表。
+    scheduleHeartbeatSoon();
+}
+
+// 处理收到的 STATUS 帧。
+// 帧格式：STATUS,deviceId,clientId,roundId,roundOpen,submitted,crc16，fieldCount 必须为 6。
+// frame：parseFrame 已成功解析的帧。
+// 行为：
+//   - 校验 deviceId 是否指向本机；不是就丢弃（STATUS 是对特定裁判机的 HELLO 回应）。
+//   - 解析 roundId，写入全局 currentServerRoundId。这是客户端发起 SUBMIT 时使用的轮号。
+//   - 如果 lockedRoundId 与新轮号不一致，触发解锁。
+//   - submitted 字段第一版只打日志，客户端自己维护 lockedForCurrentRound 状态。
+void handleStatus(const ScoreProtocol::ParsedFrame& frame) {
+    if (frame.fieldCount != 6) {
+        Serial.println("STATUS: bad field count, ignored");
+        return;
+    }
+    if (frame.fields[1] != deviceId) {
+        // 不是发给本机的 STATUS（同信道里别的裁判机的应答），静默丢弃。
+        return;
+    }
+
+    unsigned long parsedRound = 0;
+    if (!ScoreProtocol::parseUnsignedLong(frame.fields[3], parsedRound)) {
+        Serial.println("STATUS: bad roundId, ignored");
+        return;
+    }
+    currentServerRoundId = parsedRound;
+    maybeUnlockOnRoundChange();
+
+    Serial.print("STATUS: round=");
+    Serial.print(currentServerRoundId);
+    Serial.print(" open=");
+    Serial.print(frame.fields[4]);
+    Serial.print(" submitted=");
+    Serial.println(frame.fields[5]);
+}
+
+// 处理收到的 ACK 帧（对 SUBMIT 的回应）。
+// 帧格式：ACK,deviceId,clientId,roundId,msgId,status,crc16，fieldCount 必须为 6。
+// frame：parseFrame 已成功解析的帧。
+// 行为：
+//   - 校验 deviceId / roundId / msgId 与挂起的提交完全一致；任何一项不匹配 → 静默忽略
+//     （可能是过期的重传 ACK、或是同信道里发给别人的 ACK 误入本机）。
+//   - status == OK / OK_DUPLICATE / ERR_ALREADY_SUBMITTED → 视为"本轮已被服务端确认"，
+//     进入锁定，清挂起。设计文档第 8 节明确这三种都是终止状态。
+//   - status == ERR_BAD_ROUND 或其他错误 → 不锁定、清挂起，让用户看到失败原因再决定怎么办。
+void handleAck(const ScoreProtocol::ParsedFrame& frame) {
+    if (frame.fieldCount != 6) {
+        Serial.println("ACK: bad field count, ignored");
+        return;
+    }
+    if (frame.fields[1] != deviceId) {
+        return;
+    }
+    if (pendingMsgId == 0) {
+        Serial.println("ACK: no pending submit, ignored");
+        return;
+    }
+
+    unsigned long ackRound = 0;
+    unsigned long ackMsgId = 0;
+    if (!ScoreProtocol::parseUnsignedLong(frame.fields[3], ackRound) ||
+        !ScoreProtocol::parseUnsignedLong(frame.fields[4], ackMsgId)) {
+        Serial.println("ACK: bad roundId/msgId, ignored");
+        return;
+    }
+
+    if (ackRound != pendingRoundId || ackMsgId != pendingMsgId) {
+        // 过期 ACK（比如前一轮的重复 ACK 在我们已经放弃后才到）；静默忽略。
+        return;
+    }
+
+    const String& status = frame.fields[5];
+    if (status == "OK" || status == "OK_DUPLICATE" || status == "ERR_ALREADY_SUBMITTED") {
+        lockedForCurrentRound = true;
+        lockedRoundId = pendingRoundId;
+        Serial.print("ACK ");
+        Serial.print(status);
+        Serial.print(", locked for round ");
+        Serial.println(lockedRoundId);
+        clearPendingSubmit();
+    } else {
+        Serial.print("ACK ");
+        Serial.print(status);
+        Serial.print(", submit failed for round ");
+        Serial.print(pendingRoundId);
+        Serial.print(" msgId ");
+        Serial.println(pendingMsgId);
+        clearPendingSubmit();
+    }
 }
 
 // 从 Serial1（E22 透传口）按字节读入，遇到 '\n' 视为一行结束，然后做 CRC 校验、字段解析、类型识别、打印和业务处理。
@@ -259,8 +506,10 @@ void handleLoraInput() {
 
                     switch (frame.type) {
                         case ScoreProtocol::MessageType::Status:
-                            // 联通测试：收到 STATUS 即认为往返链路通。
-                            Serial.println("STATUS received successfully");
+                            handleStatus(frame);
+                            break;
+                        case ScoreProtocol::MessageType::Ack:
+                            handleAck(frame);
                             break;
                         case ScoreProtocol::MessageType::Assign:
                             handleAssign(frame);
@@ -290,6 +539,193 @@ void handleLoraInput() {
     }
 }
 
+// 把一行用 ' ' 拆分成最多 maxTokens 段，写入 tokens；连续空格按一个处理。
+// line：原始行（不含末尾换行）。
+// tokens：输出数组。
+// maxTokens：tokens 容量。
+// 返回：实际解析出的段数（0 到 maxTokens）。
+// 与服务端 tokenizeBySpace 实现一致，复用为各自项目独立函数，避免在 shared 库里塞太多东西。
+uint8_t tokenizeBySpace(const String& line, String tokens[], uint8_t maxTokens) {
+    uint8_t count = 0;
+    int start = 0;
+    const int len = line.length();
+
+    while (start < len && count < maxTokens) {
+        while (start < len && line[start] == ' ') {
+            start++;
+        }
+        if (start >= len) break;
+
+        int end = start;
+        while (end < len && line[end] != ' ') {
+            end++;
+        }
+        tokens[count++] = line.substring(start, end);
+        start = end;
+    }
+    return count;
+}
+
+// 打印客户端当前状态：deviceId / clientId / serverRoundId / locked / pending。
+// 用于 show 命令和首次启动横幅。
+void printClientState() {
+    Serial.print("Device: ");
+    Serial.print(deviceId);
+    Serial.print("  Client: ");
+    Serial.println(currentClientId);
+    Serial.print("Server roundId: ");
+    if (currentServerRoundId == 0) {
+        Serial.println("<not yet received>");
+    } else {
+        Serial.println(currentServerRoundId);
+    }
+    Serial.print("Locked: ");
+    if (lockedForCurrentRound) {
+        Serial.print("yes (round ");
+        Serial.print(lockedRoundId);
+        Serial.println(")");
+    } else {
+        Serial.println("no");
+    }
+    Serial.print("Pending: ");
+    if (pendingMsgId == 0) {
+        Serial.println("none");
+    } else {
+        Serial.print("msgId=");
+        Serial.print(pendingMsgId);
+        Serial.print(" round=");
+        Serial.print(pendingRoundId);
+        Serial.print(" red=");
+        Serial.print(pendingRed);
+        Serial.print(" blue=");
+        Serial.print(pendingBlue);
+        Serial.print(" retries=");
+        Serial.print(pendingRetries);
+        Serial.print("/");
+        Serial.println(SUBMIT_MAX_RETRIES);
+    }
+}
+
+// 处理 "submit <red> <blue>" 命令：触发一次新的 SUBMIT。
+// args：参数数组（不含 "submit" 本身）。
+// argc：参数个数。
+// 拒绝场景：
+//   1) 参数个数 != 2 或 red/blue 越界 0..99 → 提示用法。
+//   2) currentClientId == UNASSIGNED → 还未绑定，提示。
+//   3) currentServerRoundId == 0 → 还没收到过 STATUS，不知道当前轮号，提示。
+//   4) pendingMsgId != 0 → 上一笔还在重传中，避免互相打断。
+//   5) lockedForCurrentRound 且 lockedRoundId == currentServerRoundId → 本轮已被服务端确认，
+//      要等下一轮（服务端 next-round 命令）。
+// 通过后：分配新 msgId、填好 pending 状态、按 0~300ms 随机退避安排首次发送。
+// 实际发送在 loop 中的 drivePendingSubmit 完成。
+void handleSubmitCommand(const String args[], uint8_t argc) {
+    if (argc != 2) {
+        Serial.println("Usage: submit <red 0-99> <blue 0-99>");
+        return;
+    }
+    int red = 0;
+    int blue = 0;
+    if (!ScoreProtocol::parseIntInRange(args[0], 0, 99, red) ||
+        !ScoreProtocol::parseIntInRange(args[1], 0, 99, blue)) {
+        Serial.println("submit: red/blue must be in 0..99");
+        return;
+    }
+    if (currentClientId == CLIENT_ID_UNASSIGNED) {
+        Serial.println("submit: not bound yet (still UNASSIGNED), wait for server ASSIGN");
+        return;
+    }
+    if (currentServerRoundId == 0) {
+        Serial.println("submit: no STATUS received yet, cannot determine roundId");
+        return;
+    }
+    if (pendingMsgId != 0) {
+        Serial.print("submit: previous submit still pending (msgId=");
+        Serial.print(pendingMsgId);
+        Serial.println("), wait or it will fail after 5 retries");
+        return;
+    }
+    if (lockedForCurrentRound && lockedRoundId == currentServerRoundId) {
+        Serial.print("submit: already locked for round ");
+        Serial.print(lockedRoundId);
+        Serial.println(", wait for next-round");
+        return;
+    }
+
+    localMsgId++;
+    pendingMsgId = localMsgId;
+    pendingRoundId = currentServerRoundId;
+    pendingRed = red;
+    pendingBlue = blue;
+    pendingRetries = 0;
+
+    // 首次发送随机退避 0~300ms，错开多个裁判同时按提交时的信道碰撞。
+    pendingNextSendMs = millis() + random(SUBMIT_INITIAL_BACKOFF_MAX_MS + 1);
+
+    Serial.print("submit queued: round=");
+    Serial.print(pendingRoundId);
+    Serial.print(" msgId=");
+    Serial.print(pendingMsgId);
+    Serial.print(" red=");
+    Serial.print(pendingRed);
+    Serial.print(" blue=");
+    Serial.print(pendingBlue);
+    Serial.print(" first send in ");
+    Serial.print(pendingNextSendMs - millis());
+    Serial.println("ms");
+}
+
+// 从 Serial（调试串口）按字节读入命令行，遇到 '\r' 或 '\n' 视为一行结束并解析。
+// 命令格式：
+//   submit <red 0-99> <blue 0-99>
+//   show
+// 终端兼容性与服务端一致：接受 CR/LF/CRLF，解析前 trim 整行，
+// 解析前回显 "CMD: ..." 便于诊断异常输入。
+// 输入超过 80 字节直接丢弃，避免缓冲区无限增长。
+void handleSerialCommand() {
+    while (Serial.available() > 0) {
+        const char c = static_cast<char>(Serial.read());
+
+        if (c == '\r' || c == '\n') {
+            String line = serialLine;
+            serialLine = "";
+
+            line.trim();
+            if (line.length() == 0) {
+                continue;
+            }
+
+            Serial.print("CMD: ");
+            Serial.println(line);
+
+            constexpr uint8_t MAX_TOKENS = 4;
+            String tokens[MAX_TOKENS];
+            const uint8_t n = tokenizeBySpace(line, tokens, MAX_TOKENS);
+
+            if (n == 0) {
+                continue;
+            }
+
+            if (tokens[0] == "submit") {
+                handleSubmitCommand(&tokens[1], static_cast<uint8_t>(n - 1));
+            } else if (tokens[0] == "show") {
+                printClientState();
+            } else {
+                Serial.print("Unknown command: ");
+                Serial.println(tokens[0]);
+                Serial.println("Available: submit <red> <blue> / show");
+            }
+
+            continue;
+        }
+
+        if (serialLine.length() < 80) {
+            serialLine += c;
+        } else {
+            serialLine = "";
+        }
+    }
+}
+
 // Arduino 启动钩子，上电后只运行一次。
 // 职责：初始化调试串口、读取 MAC 生成 deviceId、从 NVS 加载 clientId、把 E22 控制脚切到透传模式（M0=M1=LOW）、打开 Serial1 与 E22 通信、并打印启动横幅。
 void setup() {
@@ -306,6 +742,11 @@ void setup() {
 
     // 加载持久化的 clientId。loadClientIdFromNvs 内部会 prefs.begin()，从此 prefs 在整个 loop 期间保持打开。
     loadClientIdFromNvs();
+
+    // 用 MAC + millis 给 PRNG 播种。
+    // 不同板的 MAC 不一样，所以多台裁判机同时发 SUBMIT 时各自的随机退避也会错开，
+    // 设计文档第 8 节"随机退避"防碰撞机制依赖这个独立性。
+    randomSeed(static_cast<unsigned long>(ESP.getEfuseMac() & 0xFFFFFFFFULL) ^ millis());
 
     Serial.println();
     Serial.println("score_client-lora boot");
@@ -327,18 +768,36 @@ void setup() {
     Serial1.begin(LORA_UART_BAUD, SERIAL_8N1, LORA_RX_PIN, LORA_TX_PIN);
     delay(500);
 
-    Serial.println("E22 UART transparent test ready");
-    Serial.println("Client sends HELLO every 2 seconds and reacts to ASSIGN/UNBIND.");
+    // 启动后立刻发一次 HELLO，告诉服务端本机已上线（无论已绑定还是 UNASSIGNED）。
+    // 后续保活由 loop 的 HEARTBEAT 定时器承担。
+    sendHello();
+
+    Serial.println("E22 UART transparent ready");
+    Serial.println("Serial commands: submit <red 0-99> <blue 0-99> / show");
 }
 
+// 设计文档第 9 节定义的心跳周期。
+// 未提交时较密（10s），让服务端能较快感知掉线；
+// 已提交锁定后稍疏（15s），因为锁定期间裁判机基本不参与业务，频繁通信浪费信道。
+constexpr unsigned long HEARTBEAT_INTERVAL_IDLE_MS = 10000;
+constexpr unsigned long HEARTBEAT_INTERVAL_LOCKED_MS = 15000;
+
 // Arduino 主循环，会被反复调用。
-// 每轮先处理收到的 LoRa 数据，再用静态变量按 2 秒间隔发一次 HELLO（非阻塞定时，不能用 delay 否则会丢接收）。
+// 每轮做四件事：
+//   1) 处理 LoRa 入站帧（STATUS/ACK/ASSIGN/UNBIND）
+//   2) 处理本机串口命令（submit/show）
+//   3) 按时机驱动挂起的 SUBMIT 重传
+//   4) 按 10s（未锁定）或 15s（已锁定）间隔发 HEARTBEAT（非阻塞定时）
+// lastHeartbeatMs 是全局，scheduleHeartbeatSoon 把它清 0 即可在下个 loop 拿到立即触发。
 void loop() {
     handleLoraInput();
+    handleSerialCommand();
+    drivePendingSubmit();
 
-    static unsigned long lastPing = 0;
-    if (millis() - lastPing >= 2000) {
-        lastPing = millis();
-        sendHello();
+    const unsigned long interval =
+        lockedForCurrentRound ? HEARTBEAT_INTERVAL_LOCKED_MS : HEARTBEAT_INTERVAL_IDLE_MS;
+    if (millis() - lastHeartbeatMs >= interval) {
+        lastHeartbeatMs = millis();
+        sendHeartbeat();
     }
 }
