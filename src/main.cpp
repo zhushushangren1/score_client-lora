@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <Preferences.h>
 #include <ScoreProtocol.h>
+#include <TM1637Display.h>
 
 // 裁判机 E22-400T22D 串口接线：
 // ESP32-S3 GPIO17 TX -> E22 RXD
@@ -17,6 +18,14 @@ constexpr int LORA_AUX_PIN = 11;
 constexpr int LORA_M0_PIN = 12;
 constexpr int LORA_M1_PIN = 13;
 constexpr uint32_t LORA_UART_BAUD = 9600;
+
+// TM1637 数码管接线（设计文档 4.4 节）：
+// CLK -> GPIO9，DIO -> GPIO10，VCC -> 3.3V，GND -> 共地
+constexpr int TM1637_CLK_PIN = 9;
+constexpr int TM1637_DIO_PIN = 10;
+
+// 模块全局实例。构造时立刻把 CLK/DIO 设为 OUTPUT 拉高，所以即使 setup 还没跑也不会乱亮。
+TM1637Display display(TM1637_CLK_PIN, TM1637_DIO_PIN);
 
 const int TEST_BATTERY_MV = 3800;
 
@@ -123,6 +132,19 @@ int pendingBlue = 0;
 uint8_t pendingRetries = 0;          // 已经发送了几次（首发 +1，重发 +1...）
 unsigned long pendingNextSendMs = 0; // 下一次重发的 millis() 时刻
 
+// ===== 步骤 8：TM1637 显示相关状态 =====
+
+// 显示覆盖（hold overlay）机制：在普通状态映射之上短暂强制显示一段文字，
+// 例如绑定成功后闪 2s "J1__"、提交失败后闪 3s " Err"。到期后自动回落到普通映射。
+// displayHoldUntilMs == 0 表示当前没有覆盖在生效。
+unsigned long displayHoldUntilMs = 0;
+char displayHoldText[5] = {0};  // 4 字符 + '\0'
+
+// 普通状态显示的最低刷新间隔。
+// 状态变化点会主动调 updateDisplay；这里只是兜底，让覆盖到期等情况能尽快显现。
+constexpr unsigned long DISPLAY_REFRESH_INTERVAL_MS = 200;
+unsigned long lastDisplayRefreshMs = 0;
+
 // 串口命令行缓冲。客户端串口命令暂时只用于模拟按键提交（按键属步骤 9）。
 String serialLine;
 
@@ -191,6 +213,68 @@ void sendHeartbeat() {
     };
 
     sendLoraLine(ScoreProtocol::buildFrame(fields, 5));
+}
+
+// 短暂强制显示一段文字（"hold overlay"），到期后自动回到 updateDisplay 的状态映射。
+// text：最长 4 字符；多余截断；nullptr 时取消当前 hold。
+// durationMs：覆盖持续时间。
+// 适用：绑定成功瞬间显示 "J1__"、提交失败显示 " Err" 等。
+void holdDisplay(const char* text, unsigned long durationMs) {
+    if (text == nullptr) {
+        displayHoldUntilMs = 0;
+        displayHoldText[0] = '\0';
+        return;
+    }
+    uint8_t i = 0;
+    for (; i < 4 && text[i] != '\0'; i++) {
+        displayHoldText[i] = text[i];
+    }
+    for (; i < 4; i++) {
+        displayHoldText[i] = ' ';
+    }
+    displayHoldText[4] = '\0';
+    displayHoldUntilMs = millis() + durationMs;
+}
+
+// 根据当前逻辑状态把内容推到 TM1637。
+// 优先级（从高到低）：
+//   1) 当前有未到期的 hold overlay → 直接显示 displayHoldText
+//   2) 未绑定 → deviceId 后 4 位 hex
+//   3) 正在发送中（pendingMsgId != 0）→ "SEND"
+//   4) 锁定（本轮已被服务端确认）→ "----"
+//   5) 已绑定空闲 → "00.00"（按键还没接，红蓝先固定为 0/0；步骤 9 接入按键后会替换为实时分数）
+// 每次调用会向数码管下发一组 segment 字节，TM1637 协议时序合计约 0.5ms，调用代价低。
+void updateDisplay() {
+    lastDisplayRefreshMs = millis();
+
+    if (displayHoldUntilMs != 0 && static_cast<long>(millis() - displayHoldUntilMs) < 0) {
+        display.showText(displayHoldText);
+        return;
+    }
+    if (displayHoldUntilMs != 0) {
+        // 过期，清掉 hold 标记，继续走普通映射。
+        displayHoldUntilMs = 0;
+    }
+
+    if (currentClientId == CLIENT_ID_UNASSIGNED) {
+        // 显示 deviceId 后 4 位 hex 供操作员在网页/服务端串口里识别该机。
+        const String tail = deviceId.length() >= 4 ? deviceId.substring(deviceId.length() - 4) : deviceId;
+        display.showText(tail.c_str());
+        return;
+    }
+
+    if (pendingMsgId != 0) {
+        display.showText("SEND");
+        return;
+    }
+
+    if (lockedForCurrentRound) {
+        display.showText("----");
+        return;
+    }
+
+    // 已绑定空闲：第一版没有按键，红蓝分数固定显示 00.00 占位。
+    display.showScore(0, 0);
 }
 
 // 把已成功解析的协议帧打印到调试串口，便于联通测试时观察字段内容。
@@ -290,6 +374,8 @@ void drivePendingSubmit() {
         Serial.print(" attempts, msgId=");
         Serial.println(pendingMsgId);
         clearPendingSubmit();
+        holdDisplay(" Err", 3000);
+        updateDisplay();
         return;
     }
 
@@ -319,6 +405,7 @@ void maybeUnlockOnRoundChange() {
         Serial.println("), unlocked");
         lockedForCurrentRound = false;
         lockedRoundId = 0;
+        updateDisplay();  // 从 "----" 回到 "00.00"
     }
 }
 
@@ -364,6 +451,15 @@ void handleAssign(const ScoreProtocol::ParsedFrame& frame) {
     // 绑定关系变更后尽快发心跳，让服务端回 STATUS、客户端尽早拿到 currentServerRoundId，
     // 否则会有 ~10s 窗口期内无法通过 submit 命令。
     scheduleHeartbeatSoon();
+
+    // 显示绑定确认 "J1__"/"J2__"/"J3__" 2 秒，给操作员视觉反馈。
+    // targetClient 形如 "client1"，取末尾数字。
+    char holdText[5] = "J?  ";
+    if (targetClient.length() > 0) {
+        holdText[1] = targetClient[targetClient.length() - 1];
+    }
+    holdDisplay(holdText, 2000);
+    updateDisplay();
 }
 
 // 处理收到的 UNBIND 帧。
@@ -395,6 +491,7 @@ void handleUnbind(const ScoreProtocol::ParsedFrame& frame) {
     sendUnbindAck();
     // 绑定关系变更后尽快发心跳，让服务端尽早把这台设备登记回未绑定表。
     scheduleHeartbeatSoon();
+    updateDisplay();
 }
 
 // 处理收到的 STATUS 帧。
@@ -475,6 +572,7 @@ void handleAck(const ScoreProtocol::ParsedFrame& frame) {
         Serial.print(", locked for round ");
         Serial.println(lockedRoundId);
         clearPendingSubmit();
+        updateDisplay();  // 进入 LOCKED 状态，显示 "----"
     } else {
         Serial.print("ACK ");
         Serial.print(status);
@@ -483,6 +581,11 @@ void handleAck(const ScoreProtocol::ParsedFrame& frame) {
         Serial.print(" msgId ");
         Serial.println(pendingMsgId);
         clearPendingSubmit();
+        // 提交失败显示 " Err" 3 秒提示操作员，到期后回到普通映射。
+        // 设计文档 ERROR 状态是持久的，但第一版没有按键来"清错"，先按短暂提示处理；
+        // 步骤 9 接入按键后再改成"按任意键清错"的持久状态。
+        holdDisplay(" Err", 3000);
+        updateDisplay();
     }
 }
 
@@ -604,6 +707,28 @@ void printClientState() {
         Serial.print("/");
         Serial.println(SUBMIT_MAX_RETRIES);
     }
+
+    // 显示状态：先描述应当显示的内容（与 updateDisplay 的优先级判断保持一致），
+    // 再说明是否处于 hold overlay 期。便于联调时把"软件状态"与"硬件显示"做对照。
+    Serial.print("Display: ");
+    if (displayHoldUntilMs != 0 && static_cast<long>(millis() - displayHoldUntilMs) < 0) {
+        Serial.print("hold '");
+        Serial.print(displayHoldText);
+        Serial.print("' remaining ");
+        Serial.print(displayHoldUntilMs - millis());
+        Serial.println("ms");
+    } else if (currentClientId == CLIENT_ID_UNASSIGNED) {
+        const String tail = deviceId.length() >= 4 ? deviceId.substring(deviceId.length() - 4) : deviceId;
+        Serial.print("deviceId tail '");
+        Serial.print(tail);
+        Serial.println("'");
+    } else if (pendingMsgId != 0) {
+        Serial.println("SEND");
+    } else if (lockedForCurrentRound) {
+        Serial.println("----");
+    } else {
+        Serial.println("00.00 (placeholder)");
+    }
 }
 
 // 处理 "submit <red> <blue>" 命令：触发一次新的 SUBMIT。
@@ -672,6 +797,8 @@ void handleSubmitCommand(const String args[], uint8_t argc) {
     Serial.print(" first send in ");
     Serial.print(pendingNextSendMs - millis());
     Serial.println("ms");
+
+    updateDisplay();  // 进入 SENDING 状态，显示 "SEND"
 }
 
 // 从 Serial（调试串口）按字节读入命令行，遇到 '\r' 或 '\n' 视为一行结束并解析。
@@ -768,6 +895,11 @@ void setup() {
     Serial1.begin(LORA_UART_BAUD, SERIAL_8N1, LORA_RX_PIN, LORA_TX_PIN);
     delay(500);
 
+    // 初始化数码管：满亮度（7）并按当前逻辑状态刷一次，让上电那一刻就有正确显示。
+    display.setBrightness(7);
+    display.clear();
+    updateDisplay();
+
     // 启动后立刻发一次 HELLO，告诉服务端本机已上线（无论已绑定还是 UNASSIGNED）。
     // 后续保活由 loop 的 HEARTBEAT 定时器承担。
     sendHello();
@@ -788,6 +920,8 @@ constexpr unsigned long HEARTBEAT_INTERVAL_LOCKED_MS = 15000;
 //   2) 处理本机串口命令（submit/show）
 //   3) 按时机驱动挂起的 SUBMIT 重传
 //   4) 按 10s（未锁定）或 15s（已锁定）间隔发 HEARTBEAT（非阻塞定时）
+//   5) 兜底刷新 TM1637 显示：状态变化点已主动调 updateDisplay，这里只是兜住"hold 到期"
+//      和偶发漏调用，保证显示与逻辑状态最多相差 DISPLAY_REFRESH_INTERVAL_MS。
 // lastHeartbeatMs 是全局，scheduleHeartbeatSoon 把它清 0 即可在下个 loop 拿到立即触发。
 void loop() {
     handleLoraInput();
@@ -799,5 +933,9 @@ void loop() {
     if (millis() - lastHeartbeatMs >= interval) {
         lastHeartbeatMs = millis();
         sendHeartbeat();
+    }
+
+    if (millis() - lastDisplayRefreshMs >= DISPLAY_REFRESH_INTERVAL_MS) {
+        updateDisplay();
     }
 }
