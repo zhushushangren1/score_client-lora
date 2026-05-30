@@ -1,0 +1,33 @@
+#pragma once
+
+#include <Arduino.h>
+
+// 初始化裁判端 E22 LoRa 透传串口。
+// 设置 M0/M1/AUX 引脚，切入普通透传模式，并用 Serial1 打开 GPIO41/GPIO40。
+void setupClientLoraLink();
+
+// 从 E22 UART 读取一帧文本协议。
+// frameText：输出参数，成功时为不含 CR/LF 的完整 CSV+CRC 行。
+// 返回：true=读到完整帧；false=当前没有完整帧。非阻塞。
+bool readLoraFrame(String& frameText);
+
+// 发送一行已组好 CRC、并带换行的协议文本到 E22。
+void sendLoraLine(const String& text);
+
+// 发送 HELLO，告诉服务端本机 deviceId、当前 clientId 和电池电压。
+void sendHello();
+
+// 发送 HEARTBEAT，周期性上报在线状态、电池电压和当前 clientId。
+void sendHeartbeat();
+
+// 按当前锁定状态选择 10s/15s 周期，到了时间就发送 HEARTBEAT。
+void sendHeartbeatIfDue();
+
+// 回应 ASSIGN。clientId：本机已保存/确认的 client1/client2/client3。
+void sendAssignAck(const String& clientId);
+
+// 回应 UNBIND，表示本机已清除本地绑定。
+void sendUnbindAck();
+
+// 发送当前 pending SUBMIT。调用前 pendingRoundId/pendingMsgId/pendingRed/pendingBlue 必须已填好。
+void sendSubmit();
