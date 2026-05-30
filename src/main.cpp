@@ -4,16 +4,16 @@
 #include <TM1637Display.h>
 
 // 裁判机 E22-400T22D 串口接线（改到 ESP32-S3 DevKitC 右侧连续排针，减少洞洞板飞线）：
-// ESP32-S3 GPIO41 TX -> E22 RXD
-// ESP32-S3 GPIO40 RX <- E22 TXD
+// ESP32-S3 GPIO40 TX -> E22 RXD
+// ESP32-S3 GPIO41 RX <- E22 TXD
 // ESP32-S3 GPIO42     <- E22 AUX
 // ESP32-S3 GPIO38     -> E22 M0
 // ESP32-S3 GPIO39     -> E22 M1
 //
 // M0=LOW 且 M1=LOW 时，E22 进入普通透明传输模式。
 // E22 模块出厂串口波特率通常是 9600。
-constexpr int LORA_TX_PIN = 41;
-constexpr int LORA_RX_PIN = 40;
+constexpr int LORA_TX_PIN = 40;
+constexpr int LORA_RX_PIN = 41;
 constexpr int LORA_AUX_PIN = 42;
 constexpr int LORA_M0_PIN = 38;
 constexpr int LORA_M1_PIN = 39;
