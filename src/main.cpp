@@ -3,29 +3,54 @@
 #include <ScoreProtocol.h>
 #include <TM1637Display.h>
 
-// 裁判机 E22-400T22D 串口接线：
-// ESP32-S3 GPIO17 TX -> E22 RXD
-// ESP32-S3 GPIO18 RX <- E22 TXD
-// ESP32-S3 GPIO11     <- E22 AUX
-// ESP32-S3 GPIO12     -> E22 M0
-// ESP32-S3 GPIO13     -> E22 M1
+// 裁判机 E22-400T22D 串口接线（改到 ESP32-S3 DevKitC 右侧连续排针，减少洞洞板飞线）：
+// ESP32-S3 GPIO41 TX -> E22 RXD
+// ESP32-S3 GPIO40 RX <- E22 TXD
+// ESP32-S3 GPIO42     <- E22 AUX
+// ESP32-S3 GPIO38     -> E22 M0
+// ESP32-S3 GPIO39     -> E22 M1
 //
 // M0=LOW 且 M1=LOW 时，E22 进入普通透明传输模式。
 // E22 模块出厂串口波特率通常是 9600。
-constexpr int LORA_TX_PIN = 17;
-constexpr int LORA_RX_PIN = 18;
-constexpr int LORA_AUX_PIN = 11;
-constexpr int LORA_M0_PIN = 12;
-constexpr int LORA_M1_PIN = 13;
+constexpr int LORA_TX_PIN = 41;
+constexpr int LORA_RX_PIN = 40;
+constexpr int LORA_AUX_PIN = 42;
+constexpr int LORA_M0_PIN = 38;
+constexpr int LORA_M1_PIN = 39;
 constexpr uint32_t LORA_UART_BAUD = 9600;
 
 // TM1637 数码管接线（设计文档 4.4 节）：
-// CLK -> GPIO9，DIO -> GPIO10，VCC -> 3.3V，GND -> 共地
-constexpr int TM1637_CLK_PIN = 9;
-constexpr int TM1637_DIO_PIN = 10;
+// CLK -> GPIO48，DIO -> GPIO47，VCC -> 3.3V，GND -> 共地
+// 避开 GPIO35~GPIO37：N16R8 等带 OPI PSRAM 的板卡用这三个脚连八线 PSRAM，不能复用。
+constexpr int TM1637_CLK_PIN = 48;
+constexpr int TM1637_DIO_PIN = 47;
 
 // 模块全局实例。构造时立刻把 CLK/DIO 设为 OUTPUT 拉高，所以即使 setup 还没跑也不会乱亮。
 TM1637Display display(TM1637_CLK_PIN, TM1637_DIO_PIN);
+
+// 5 个录分按键（设计文档 4.5 节）。
+// 接法：GPIO ---- 按键 ---- GND，使用 INPUT_PULLUP，按下时 GPIO 被拉到 LOW。
+// 顺序与下面 BUTTON_COUNT/handleButtonShort 的 switch 一一对应。
+constexpr int BUTTON_RED_1_PIN  = 4;  // 红 +1 / 长按 -1
+constexpr int BUTTON_RED_2_PIN  = 5;  // 红 +2 / 长按 -2
+constexpr int BUTTON_BLUE_1_PIN = 6;  // 蓝 +1 / 长按 -1
+constexpr int BUTTON_BLUE_2_PIN = 7;  // 蓝 +2 / 长按 -2
+constexpr int BUTTON_SUBMIT_PIN = 8;  // 短按提交 / 长按本轮清零
+
+constexpr uint8_t BUTTON_COUNT = 5;
+constexpr int BUTTON_PINS[BUTTON_COUNT] = {
+    BUTTON_RED_1_PIN,
+    BUTTON_RED_2_PIN,
+    BUTTON_BLUE_1_PIN,
+    BUTTON_BLUE_2_PIN,
+    BUTTON_SUBMIT_PIN
+};
+
+// 软件去抖时间：20ms 覆盖大多数轻触开关的弹跳窗口。
+constexpr unsigned long BUTTON_DEBOUNCE_MS = 20;
+// 长按判定阈值：600ms。低于这个值视为短按，达到这个时长仍未松手则触发一次长按事件。
+// 选 600 是因为低于 500 误触多、高于 800 用户会感觉手感迟钝。
+constexpr unsigned long BUTTON_LONG_PRESS_MS = 600;
 
 const int TEST_BATTERY_MV = 3800;
 
@@ -144,6 +169,28 @@ char displayHoldText[5] = {0};  // 4 字符 + '\0'
 // 状态变化点会主动调 updateDisplay；这里只是兜底，让覆盖到期等情况能尽快显现。
 constexpr unsigned long DISPLAY_REFRESH_INTERVAL_MS = 200;
 unsigned long lastDisplayRefreshMs = 0;
+
+// ===== 步骤 9：按键 + 本地编辑分数 =====
+
+// 编辑中的红蓝分数（设计文档 EDITING 状态）。
+// 钳到 0..99；boot/绑定变更/换轮/长按清零 时被复位为 0。
+// 不持久化到 NVS——未提交的分数没必要跨重启保留。
+int localRed = 0;
+int localBlue = 0;
+
+// 每个按键的去抖与长按状态。
+// stableLevel：去抖后的稳定电平（HIGH=未按、LOW=按下）。
+// lastRawLevel / lastRawChangeMs：最近一次原始电平及其变化时刻，用来在 BUTTON_DEBOUNCE_MS 后采纳为稳定电平。
+// pressedAtMs：最近一次稳定电平从 HIGH 转 LOW（按下沿）的时刻，用于长按判定。
+// longPressFired：本次按下期间是否已经触发过长按事件，避免松手时再误触发短按。
+struct ButtonState {
+    bool stableLevel = true;        // 上电默认松开
+    bool lastRawLevel = true;
+    unsigned long lastRawChangeMs = 0;
+    unsigned long pressedAtMs = 0;
+    bool longPressFired = false;
+};
+ButtonState buttons[BUTTON_COUNT];
 
 // 串口命令行缓冲。客户端串口命令暂时只用于模拟按键提交（按键属步骤 9）。
 String serialLine;
@@ -273,8 +320,8 @@ void updateDisplay() {
         return;
     }
 
-    // 已绑定空闲：第一版没有按键，红蓝分数固定显示 00.00 占位。
-    display.showScore(0, 0);
+    // 已绑定空闲：显示用户当前编辑的红蓝分数（步骤 9 按键加减后实时变化）。
+    display.showScore(localRed, localBlue);
 }
 
 // 把已成功解析的协议帧打印到调试串口，便于联通测试时观察字段内容。
@@ -405,7 +452,10 @@ void maybeUnlockOnRoundChange() {
         Serial.println("), unlocked");
         lockedForCurrentRound = false;
         lockedRoundId = 0;
-        updateDisplay();  // 从 "----" 回到 "00.00"
+        // 新一轮回到 EDITING：清掉上一轮残留分数，否则数码管会停留在上一轮的最终值。
+        localRed = 0;
+        localBlue = 0;
+        updateDisplay();
     }
 }
 
@@ -731,49 +781,30 @@ void printClientState() {
     }
 }
 
-// 处理 "submit <red> <blue>" 命令：触发一次新的 SUBMIT。
-// args：参数数组（不含 "submit" 本身）。
-// argc：参数个数。
-// 拒绝场景：
-//   1) 参数个数 != 2 或 red/blue 越界 0..99 → 提示用法。
-//   2) currentClientId == UNASSIGNED → 还未绑定，提示。
-//   3) currentServerRoundId == 0 → 还没收到过 STATUS，不知道当前轮号，提示。
-//   4) pendingMsgId != 0 → 上一笔还在重传中，避免互相打断。
-//   5) lockedForCurrentRound 且 lockedRoundId == currentServerRoundId → 本轮已被服务端确认，
-//      要等下一轮（服务端 next-round 命令）。
-// 通过后：分配新 msgId、填好 pending 状态、按 0~300ms 随机退避安排首次发送。
-// 实际发送在 loop 中的 drivePendingSubmit 完成。
-void handleSubmitCommand(const String args[], uint8_t argc) {
-    if (argc != 2) {
-        Serial.println("Usage: submit <red 0-99> <blue 0-99>");
-        return;
-    }
-    int red = 0;
-    int blue = 0;
-    if (!ScoreProtocol::parseIntInRange(args[0], 0, 99, red) ||
-        !ScoreProtocol::parseIntInRange(args[1], 0, 99, blue)) {
-        Serial.println("submit: red/blue must be in 0..99");
-        return;
-    }
+// 尝试发起一次新的 SUBMIT。
+// red / blue：本次提交的分数（不会再次钳位，调用方负责保证 0..99）。
+// 返回：true=已入挂起队列等待发送；false=被前置条件拒绝（已 Serial.print 了具体原因）。
+// 共享逻辑给串口命令和按键短按"提交"复用，避免分数提交流程分裂成两份代码。
+bool tryQueueSubmit(int red, int blue) {
     if (currentClientId == CLIENT_ID_UNASSIGNED) {
         Serial.println("submit: not bound yet (still UNASSIGNED), wait for server ASSIGN");
-        return;
+        return false;
     }
     if (currentServerRoundId == 0) {
         Serial.println("submit: no STATUS received yet, cannot determine roundId");
-        return;
+        return false;
     }
     if (pendingMsgId != 0) {
         Serial.print("submit: previous submit still pending (msgId=");
         Serial.print(pendingMsgId);
         Serial.println("), wait or it will fail after 5 retries");
-        return;
+        return false;
     }
     if (lockedForCurrentRound && lockedRoundId == currentServerRoundId) {
         Serial.print("submit: already locked for round ");
         Serial.print(lockedRoundId);
         Serial.println(", wait for next-round");
-        return;
+        return false;
     }
 
     localMsgId++;
@@ -799,6 +830,154 @@ void handleSubmitCommand(const String args[], uint8_t argc) {
     Serial.println("ms");
 
     updateDisplay();  // 进入 SENDING 状态，显示 "SEND"
+    return true;
+}
+
+// 把 localRed/localBlue 复位为 0/0 并刷新显示。
+// 用途：长按提交键清零、绑定关系变化、轮次推进等。
+void resetLocalScore() {
+    localRed = 0;
+    localBlue = 0;
+    updateDisplay();
+}
+
+// 增减红/蓝分数，自动钳到 0..99。
+// 调用方提供有符号的 delta，比如 +1、-2。
+// 调用结束自动刷显示，避免操作员看不到反馈。
+void adjustRed(int delta) {
+    int v = localRed + delta;
+    if (v < 0) v = 0;
+    if (v > 99) v = 99;
+    localRed = v;
+    updateDisplay();
+}
+void adjustBlue(int delta) {
+    int v = localBlue + delta;
+    if (v < 0) v = 0;
+    if (v > 99) v = 99;
+    localBlue = v;
+    updateDisplay();
+}
+
+// 按键事件分发：短按。
+// idx：0..4，与 BUTTON_PINS 顺序一致。
+// 设计文档第 3.4 节：
+//   红+1=短按红+1，红+2=短按红+2，蓝同理；提交键短按 → 触发 SUBMIT（用当前 localRed/localBlue）。
+void handleButtonShort(uint8_t idx) {
+    switch (idx) {
+        case 0: adjustRed(+1); break;
+        case 1: adjustRed(+2); break;
+        case 2: adjustBlue(+1); break;
+        case 3: adjustBlue(+2); break;
+        case 4:
+            Serial.print("BUTTON: submit red=");
+            Serial.print(localRed);
+            Serial.print(" blue=");
+            Serial.println(localBlue);
+            tryQueueSubmit(localRed, localBlue);
+            break;
+        default: break;
+    }
+}
+
+// 按键事件分发：长按。
+// 设计文档第 3.4 节：
+//   红+1 长按 → 红-1；红+2 长按 → 红-2；蓝同理；提交键长按 → 本轮清零（localRed/localBlue = 0）。
+void handleButtonLong(uint8_t idx) {
+    switch (idx) {
+        case 0: adjustRed(-1); break;
+        case 1: adjustRed(-2); break;
+        case 2: adjustBlue(-1); break;
+        case 3: adjustBlue(-2); break;
+        case 4:
+            Serial.println("BUTTON: long-submit → clear round (red/blue → 0)");
+            resetLocalScore();
+            break;
+        default: break;
+    }
+}
+
+// 在哪些状态下应该屏蔽按键？
+// 设计文档第 9 节：
+//   - UNASSIGNED：未绑定时编辑分数没意义，屏蔽。
+//   - SENDING（有挂起提交）：屏蔽，避免一边重传一边改分。
+//   - LOCKED：本轮已确认，屏蔽（需等服务端 next-round 解锁）。
+// ERROR 状态目前用 hold overlay 表达、不持久，按键不在此屏蔽。
+bool buttonsActive() {
+    if (currentClientId == CLIENT_ID_UNASSIGNED) return false;
+    if (pendingMsgId != 0) return false;
+    if (lockedForCurrentRound) return false;
+    return true;
+}
+
+// 扫描所有按键，做去抖与短按/长按事件分发。
+// 在 loop 里每轮调用。每个按键独立维护去抖与长按计时，状态间互不影响。
+// 事件触发时机：
+//   - 短按事件：在释放沿（HIGH→LOW→稳定 HIGH 之后），如果这次按下期间没有触发过长按。
+//   - 长按事件：稳定 LOW 持续达到 BUTTON_LONG_PRESS_MS 时一次性触发；标记 longPressFired，
+//     避免释放沿再额外触发短按。
+// 按键被屏蔽（!buttonsActive）时仍然继续扫描状态机以维持电平一致，但短/长按事件被丢弃，
+// 不会污染计分。
+void pollButtons() {
+    const unsigned long now = millis();
+    for (uint8_t i = 0; i < BUTTON_COUNT; i++) {
+        ButtonState& b = buttons[i];
+        const bool raw = digitalRead(BUTTON_PINS[i]) != LOW;  // true=HIGH=松开，false=LOW=按下
+
+        if (raw != b.lastRawLevel) {
+            b.lastRawLevel = raw;
+            b.lastRawChangeMs = now;
+        }
+
+        if (now - b.lastRawChangeMs >= BUTTON_DEBOUNCE_MS && raw != b.stableLevel) {
+            b.stableLevel = raw;
+            if (!raw) {
+                // 按下沿（高→低）
+                b.pressedAtMs = now;
+                b.longPressFired = false;
+            } else {
+                // 释放沿（低→高）
+                if (!b.longPressFired && buttonsActive()) {
+                    handleButtonShort(i);
+                }
+            }
+        }
+
+        // 稳定 LOW 持续达到阈值，且本次按下还没触发过长按 → 触发长按事件。
+        if (!b.stableLevel && !b.longPressFired &&
+            now - b.pressedAtMs >= BUTTON_LONG_PRESS_MS) {
+            b.longPressFired = true;
+            if (buttonsActive()) {
+                handleButtonLong(i);
+            }
+        }
+    }
+}
+
+// 处理 "submit" 命令。两种形式：
+//   submit                 → 使用当前 localRed/localBlue（与按键"短按提交"等价）
+//   submit <red> <blue>    → 先把分数 set 到 localRed/localBlue，再触发提交（调试快捷方式）
+// 任何形式下 red/blue 都必须在 0..99 范围内，否则提示用法不变更状态。
+void handleSubmitCommand(const String args[], uint8_t argc) {
+    int red = localRed;
+    int blue = localBlue;
+
+    if (argc == 2) {
+        if (!ScoreProtocol::parseIntInRange(args[0], 0, 99, red) ||
+            !ScoreProtocol::parseIntInRange(args[1], 0, 99, blue)) {
+            Serial.println("submit: red/blue must be in 0..99");
+            return;
+        }
+        localRed = red;
+        localBlue = blue;
+        updateDisplay();
+    } else if (argc != 0) {
+        Serial.println("Usage: submit                 # 使用当前红蓝分数提交");
+        Serial.println("       submit <red> <blue>    # 先 set 再提交，0..99");
+        return;
+    }
+
+    tryQueueSubmit(red, blue);
 }
 
 // 从 Serial（调试串口）按字节读入命令行，遇到 '\r' 或 '\n' 视为一行结束并解析。
@@ -892,6 +1071,11 @@ void setup() {
     digitalWrite(LORA_M0_PIN, LOW);
     digitalWrite(LORA_M1_PIN, LOW);
 
+    // 5 个录分按键：INPUT_PULLUP，按下时由按键拉到 GND（设计文档 4.5 节）。
+    for (uint8_t i = 0; i < BUTTON_COUNT; i++) {
+        pinMode(BUTTON_PINS[i], INPUT_PULLUP);
+    }
+
     Serial1.begin(LORA_UART_BAUD, SERIAL_8N1, LORA_RX_PIN, LORA_TX_PIN);
     delay(500);
 
@@ -926,6 +1110,7 @@ constexpr unsigned long HEARTBEAT_INTERVAL_LOCKED_MS = 15000;
 void loop() {
     handleLoraInput();
     handleSerialCommand();
+    pollButtons();
     drivePendingSubmit();
 
     const unsigned long interval =
