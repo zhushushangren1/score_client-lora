@@ -52,7 +52,71 @@ constexpr unsigned long BUTTON_DEBOUNCE_MS = 20;
 // 选 600 是因为低于 500 误触多、高于 800 用户会感觉手感迟钝。
 constexpr unsigned long BUTTON_LONG_PRESS_MS = 600;
 
-const int TEST_BATTERY_MV = 3800;
+// ===== 步骤 10：电池电压采样 + 低电量 LED =====
+// 设计文档 4.6 节：电池正极经 100K+100K 分压后接 GPIO15，节点电压 = 电池电压 / 2。
+// GPIO15 = ADC2_CH4；裁判机不开 WiFi，ADC2 可正常使用。
+constexpr int BATTERY_ADC_PIN = 15;
+// 分压比：节点电压 × 2 = 电池电压。
+constexpr float BATTERY_DIVIDER_RATIO = 2.0f;
+// 实测校准系数：用万用表量电池真实电压 ÷ 程序读出的电压，把比值填到这里，修正分压电阻与 ADC 偏差。
+constexpr float BATTERY_CALIBRATION = 1.0f;
+// 采样周期与每次平均样本数：5s 刷新一次够用，8 次平均抑制 ADC 抖动。
+constexpr unsigned long BATTERY_SAMPLE_INTERVAL_MS = 5000;
+constexpr int BATTERY_SAMPLE_COUNT = 8;
+// 低电量阈值（设计文档第 9 节）：低于此值闪 LED 提示，但仍允许使用/提交。
+constexpr int BATTERY_LOW_MV = 3700;
+
+// 低电量指示 LED：GPIO2 -> 1K 限流电阻 -> LED 正极，LED 负极 -> GND（高电平点亮）。
+// 换引脚改这里即可；GPIO2 是普通 GPIO，未占用启动/flash/PSRAM。
+constexpr int BATTERY_LOW_LED_PIN = 2;
+constexpr unsigned long BATTERY_LOW_BLINK_INTERVAL_MS = 400;
+
+// 最近一次换算出的电池电压（毫伏）。0 表示尚未采样。
+// setup() 首次采样在 sendHello() 之前完成，保证第一帧 HELLO 就带真实电压。
+int batteryMv = 0;
+unsigned long lastBatterySampleMs = 0;
+
+// 低电量 LED 闪烁状态。
+unsigned long lastBatteryBlinkMs = 0;
+bool batteryLowLedOn = false;
+
+// 读一次电池电压（毫伏）：多次采样取平均，再按分压比和校准系数换算。
+// analogReadMilliVolts 返回引脚处已校准电压，乘 2（分压比）即电池电压。
+int readBatteryMv() {
+    uint32_t sum = 0;
+    for (int i = 0; i < BATTERY_SAMPLE_COUNT; i++) {
+        sum += analogReadMilliVolts(BATTERY_ADC_PIN);
+    }
+    const float nodeMv = static_cast<float>(sum) / BATTERY_SAMPLE_COUNT;
+    return static_cast<int>(nodeMv * BATTERY_DIVIDER_RATIO * BATTERY_CALIBRATION + 0.5f);
+}
+
+// 到周期就刷新一次 batteryMv（非阻塞）。在 loop 中调用。
+void sampleBatteryIfDue() {
+    if (millis() - lastBatterySampleMs < BATTERY_SAMPLE_INTERVAL_MS) {
+        return;
+    }
+    lastBatterySampleMs = millis();
+    batteryMv = readBatteryMv();
+}
+
+// 电量低于阈值时闪烁 LED，正常时熄灭（非阻塞，loop 中调用）。
+// 仅作低电量指示：不影响数码管显示，也不拦截提交（按需求只用 LED + 上报服务端）。
+void updateBatteryLowLed() {
+    const bool low = (batteryMv != 0 && batteryMv < BATTERY_LOW_MV);
+    if (!low) {
+        if (batteryLowLedOn) {
+            batteryLowLedOn = false;
+            digitalWrite(BATTERY_LOW_LED_PIN, LOW);
+        }
+        return;
+    }
+    if (millis() - lastBatteryBlinkMs >= BATTERY_LOW_BLINK_INTERVAL_MS) {
+        lastBatteryBlinkMs = millis();
+        batteryLowLedOn = !batteryLowLedOn;
+        digitalWrite(BATTERY_LOW_LED_PIN, batteryLowLedOn ? HIGH : LOW);
+    }
+}
 
 // NVS（Preferences）命名空间，用于持久化裁判机本地状态。
 // 命名空间名长度限制 15 字节，"score_client" 足够短且语义清晰。
@@ -218,13 +282,13 @@ void sendLoraLine(const String& text) {
 // 帧格式：HELLO,deviceId,currentClientId,battMv,crc16（CRC 由 buildFrame 自动追加）。
 // HELLO 语义：上电/重连时的一次性自报，不是周期保活。
 // 周期保活由 sendHeartbeat 负责（10s/15s 间隔，详见设计文档第 9 节）。
-// deviceId / currentClientId 来自全局变量；battMv 仍为联通测试用常量，等 ADC 接入后再换成真值。
+// deviceId / currentClientId / batteryMv 均来自全局变量；batteryMv 由 ADC 周期采样（步骤 10）。
 void sendHello() {
     String fields[] = {
         "HELLO",
         deviceId,
         currentClientId,
-        String(TEST_BATTERY_MV)
+        String(batteryMv)
     };
 
     sendLoraLine(ScoreProtocol::buildFrame(fields, 4));
@@ -255,7 +319,7 @@ void sendHeartbeat() {
         "HEARTBEAT",
         deviceId,
         currentClientId,
-        String(TEST_BATTERY_MV),
+        String(batteryMv),
         String(localHeartbeatMsgId)
     };
 
@@ -375,7 +439,7 @@ void sendUnbindAck() {
 // 组装并发送一帧 SUBMIT。
 // 帧格式：SUBMIT,deviceId,clientId,roundId,msgId,red,blue,battMv,crc16。
 // 调用方负责保证 pendingMsgId/pendingRoundId/pendingRed/pendingBlue 已被填好。
-// battMv 暂用联通测试常量，等步骤 10 ADC 接入后换成真值。
+// battMv 取自全局 batteryMv（GPIO15 ADC 周期采样，步骤 10）。
 void sendSubmit() {
     String fields[] = {
         "SUBMIT",
@@ -385,7 +449,7 @@ void sendSubmit() {
         String(pendingMsgId),
         String(pendingRed),
         String(pendingBlue),
-        String(TEST_BATTERY_MV)
+        String(batteryMv)
     };
     sendLoraLine(ScoreProtocol::buildFrame(fields, 8));
 }
@@ -1084,6 +1148,18 @@ void setup() {
     display.clear();
     updateDisplay();
 
+    // 低电量 LED 输出，默认熄灭。
+    pinMode(BATTERY_LOW_LED_PIN, OUTPUT);
+    digitalWrite(BATTERY_LOW_LED_PIN, LOW);
+
+    // 电池 ADC：11dB 衰减让节点电压（满电约 2.1V）落在量程内；先采一次，保证首帧 HELLO 带真实电压。
+    analogReadResolution(12);
+    analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
+    batteryMv = readBatteryMv();
+    Serial.print("Battery: ");
+    Serial.print(batteryMv);
+    Serial.println("mV");
+
     // 启动后立刻发一次 HELLO，告诉服务端本机已上线（无论已绑定还是 UNASSIGNED）。
     // 后续保活由 loop 的 HEARTBEAT 定时器承担。
     sendHello();
@@ -1099,12 +1175,14 @@ constexpr unsigned long HEARTBEAT_INTERVAL_IDLE_MS = 10000;
 constexpr unsigned long HEARTBEAT_INTERVAL_LOCKED_MS = 15000;
 
 // Arduino 主循环，会被反复调用。
-// 每轮做四件事：
+// 每轮做这些事：
 //   1) 处理 LoRa 入站帧（STATUS/ACK/ASSIGN/UNBIND）
 //   2) 处理本机串口命令（submit/show）
-//   3) 按时机驱动挂起的 SUBMIT 重传
-//   4) 按 10s（未锁定）或 15s（已锁定）间隔发 HEARTBEAT（非阻塞定时）
-//   5) 兜底刷新 TM1637 显示：状态变化点已主动调 updateDisplay，这里只是兜住"hold 到期"
+//   3) 扫描按键
+//   4) 按时机驱动挂起的 SUBMIT 重传
+//   5) 周期采样电池电压，并按电量驱动低电量 LED
+//   6) 按 10s（未锁定）或 15s（已锁定）间隔发 HEARTBEAT（非阻塞定时）
+//   7) 兜底刷新 TM1637 显示：状态变化点已主动调 updateDisplay，这里只是兜住"hold 到期"
 //      和偶发漏调用，保证显示与逻辑状态最多相差 DISPLAY_REFRESH_INTERVAL_MS。
 // lastHeartbeatMs 是全局，scheduleHeartbeatSoon 把它清 0 即可在下个 loop 拿到立即触发。
 void loop() {
@@ -1112,6 +1190,8 @@ void loop() {
     handleSerialCommand();
     pollButtons();
     drivePendingSubmit();
+    sampleBatteryIfDue();
+    updateBatteryLowLed();
 
     const unsigned long interval =
         lockedForCurrentRound ? HEARTBEAT_INTERVAL_LOCKED_MS : HEARTBEAT_INTERVAL_IDLE_MS;
