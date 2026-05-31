@@ -1,3 +1,6 @@
+// 裁判端程序入口。
+// 负责按顺序初始化串口、设备身份、LoRa、按键、数码管、电池检测，
+// 并在 loop() 中调度各个非阻塞模块。
 #include <Arduino.h>
 
 #include "BatteryMonitor.h"

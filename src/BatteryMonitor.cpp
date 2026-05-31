@@ -1,3 +1,5 @@
+// 裁判端电池监测模块实现。
+// 负责读取 GPIO15 分压后的电池电压、换算成毫伏值，并驱动低电量提示灯。
 #include "BatteryMonitor.h"
 
 #include <Arduino.h>

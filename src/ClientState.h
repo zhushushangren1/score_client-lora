@@ -1,3 +1,5 @@
+// 裁判端全局状态声明。
+// 定义各模块共享的设备身份、绑定状态、本地分数、pending SUBMIT 和心跳状态。
 #pragma once
 
 #include <Arduino.h>

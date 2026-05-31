@@ -1,3 +1,5 @@
+// 裁判端实体按键模块实现。
+// 负责 5 个录分/提交按键的 GPIO 初始化、去抖、短按和长按事件分发。
 #include "ClientButtons.h"
 
 #include <Arduino.h>
@@ -7,10 +9,10 @@
 
 namespace {
 
-constexpr int BUTTON_RED_1_PIN = 4;
-constexpr int BUTTON_RED_2_PIN = 5;
-constexpr int BUTTON_BLUE_1_PIN = 6;
-constexpr int BUTTON_BLUE_2_PIN = 7;
+constexpr int BUTTON_RED_1_PIN = 5;
+constexpr int BUTTON_RED_2_PIN = 4;
+constexpr int BUTTON_BLUE_1_PIN = 13;
+constexpr int BUTTON_BLUE_2_PIN = 14;
 constexpr int BUTTON_SUBMIT_PIN = 8;
 
 constexpr uint8_t BUTTON_COUNT = 5;

@@ -1,3 +1,5 @@
+// 裁判端 TM1637 数码管显示模块实现。
+// 负责未绑定短码、发送中、已锁定、本地比分和临时提示文本的显示优先级。
 #include "ClientDisplay.h"
 
 #include <TM1637Display.h>

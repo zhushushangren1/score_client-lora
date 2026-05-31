@@ -1,3 +1,5 @@
+// 裁判端全局状态和持久化实现。
+// 负责生成 deviceId、读取/保存 clientId，并集中维护提交、轮次、心跳等跨模块状态。
 #include "ClientState.h"
 
 #include <Preferences.h>

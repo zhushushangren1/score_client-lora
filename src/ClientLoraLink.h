@@ -1,3 +1,5 @@
+// 裁判端 LoRa UART 链路模块接口。
+// 对上层隐藏 E22 串口细节，只暴露读一帧和发送各类协议帧的函数。
 #pragma once
 
 #include <Arduino.h>

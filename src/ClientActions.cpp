@@ -1,3 +1,5 @@
+// 裁判端本地业务动作实现。
+// 负责录分增减、提交排队、SUBMIT 重试状态机、提交成功后的锁定/解锁逻辑。
 #include "ClientActions.h"
 
 #include "ClientDisplay.h"

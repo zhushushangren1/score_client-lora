@@ -1,3 +1,5 @@
+// 裁判端 LoRa UART 链路模块实现。
+// 负责 E22 透传串口初始化、按行收发协议帧，以及构造 HELLO/HEARTBEAT/SUBMIT 等上行帧。
 #include "ClientLoraLink.h"
 
 #include <ScoreProtocol.h>

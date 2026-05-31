@@ -1,3 +1,5 @@
+// 裁判端 LoRa 入站协议处理实现。
+// 负责解析服务端下发的 STATUS、ACK、ASSIGN、UNBIND，并更新本机绑定/提交/显示状态。
 #include "ClientProtocolHandlers.h"
 
 #include <Arduino.h>
