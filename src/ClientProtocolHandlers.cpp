@@ -120,12 +120,34 @@ void handleStatus(const ScoreProtocol::ParsedFrame& frame) {
     // STATUS 是客户端获知“已经进入新一轮”的唯一来源，因此这里触发解锁检查。
     maybeUnlockOnRoundChange();
 
+    const bool statusSubmitted = (frame.fields[5] == "1");
+    bool displayNeedsRefresh = false;
+    if (statusSubmitted) {
+        // STATUS 的 submitted=1 表示服务端已经记录了本裁判本轮成绩。
+        // 这是 ACK 丢包时的兜底确认：服务端日志已经收分，但裁判端没收到 ACK 时，
+        // 不能继续重传到耗尽后显示 Err，而应该按服务端状态锁定本轮。
+        if (pendingMsgId != 0 && pendingRoundId == currentServerRoundId) {
+            Serial.println("STATUS: submitted=1 for pending submit, treating as accepted");
+            clearPendingSubmit();
+            displayNeedsRefresh = true;
+        }
+        if (!lockedForCurrentRound || lockedRoundId != currentServerRoundId) {
+            lockedForCurrentRound = true;
+            lockedRoundId = currentServerRoundId;
+            displayNeedsRefresh = true;
+        }
+    }
+
     Serial.print("STATUS: round=");
     Serial.print(currentServerRoundId);
     Serial.print(" open=");
     Serial.print(frame.fields[4]);
     Serial.print(" submitted=");
     Serial.println(frame.fields[5]);
+
+    if (displayNeedsRefresh) {
+        updateDisplay();
+    }
 }
 
 void handleAck(const ScoreProtocol::ParsedFrame& frame) {

@@ -9,11 +9,11 @@
 namespace {
 
 // SUBMIT 可靠性参数：
-// 首发前随机退避 0~300ms，减少多台裁判同时提交时的空中碰撞；
-// 未收到 ACK 时每 300~1200ms 重发一次，最多 5 次。
-constexpr unsigned long SUBMIT_INITIAL_BACKOFF_MAX_MS = 300;
-constexpr unsigned long SUBMIT_RETRY_BACKOFF_MIN_MS = 300;
-constexpr unsigned long SUBMIT_RETRY_BACKOFF_MAX_MS = 1200;
+// 首发前随机退避 0~500ms，减少多台裁判同时提交时的空中碰撞；
+// 未收到 ACK/STATUS 确认时每 800~2000ms 重发一次，最多发送 5 次。
+constexpr unsigned long SUBMIT_INITIAL_BACKOFF_MAX_MS = 500;
+constexpr unsigned long SUBMIT_RETRY_BACKOFF_MIN_MS = 800;
+constexpr unsigned long SUBMIT_RETRY_BACKOFF_MAX_MS = 2000;
 constexpr uint8_t SUBMIT_MAX_RETRIES = 5;
 
 int clampScore(int value) {
