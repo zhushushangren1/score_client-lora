@@ -13,6 +13,13 @@ void setupClientLoraLink();
 // 返回：true=读到完整帧；false=当前没有完整帧。非阻塞。
 bool readLoraFrame(String& frameText);
 
+// Enable or disable LoRa UART diagnostics printed from updateClientLoraDebug().
+void setClientLoraDebugEnabled(bool enabled);
+
+// Print one diagnostic snapshot each second while debug is enabled.
+// TX counters and AUX samples help confirm whether the client E22 reacts to UART writes.
+void updateClientLoraDebug();
+
 // 发送一行已组好 CRC、并带换行的协议文本到 E22。
 void sendLoraLine(const String& text);
 

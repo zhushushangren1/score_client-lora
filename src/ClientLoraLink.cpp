@@ -25,6 +25,14 @@ constexpr unsigned long HEARTBEAT_INTERVAL_IDLE_MS = 10000;
 constexpr unsigned long HEARTBEAT_INTERVAL_LOCKED_MS = 15000;
 
 String loraLine;
+bool loraDebugEnabled = false;
+unsigned long lastLoraDebugPrintMs = 0;
+uint32_t loraTxCount = 0;
+uint32_t loraRxRawByteCount = 0;
+uint32_t loraRxFrameCount = 0;
+uint32_t loraRxOverflowCount = 0;
+int lastAuxBeforeTx = -1;
+int lastAuxAfterTx = -1;
 
 void waitForLoraReady() {
     const unsigned long start = millis();
@@ -58,6 +66,7 @@ void setupClientLoraLink() {
 bool readLoraFrame(String& frameText) {
     while (Serial1.available() > 0) {
         const char c = static_cast<char>(Serial1.read());
+        loraRxRawByteCount++;
         if (c == '\r') {
             // 兼容 CRLF：协议帧以 '\n' 结束，'\r' 只作为行尾装饰直接忽略。
             continue;
@@ -71,6 +80,7 @@ bool readLoraFrame(String& frameText) {
             // 收到换行才认为一帧完整；返回前清空缓冲，准备接下一帧。
             frameText = loraLine;
             loraLine = "";
+            loraRxFrameCount++;
             return true;
         }
 
@@ -79,16 +89,64 @@ bool readLoraFrame(String& frameText) {
         } else {
             // 超长行大概率已经失去同步，丢弃整行等待下一个换行重新同步。
             loraLine = "";
+            loraRxOverflowCount++;
         }
     }
     return false;
 }
 
+void setClientLoraDebugEnabled(bool enabled) {
+    loraDebugEnabled = enabled;
+    lastLoraDebugPrintMs = 0;
+    Serial.print("LoRa debug ");
+    Serial.println(enabled ? "ON" : "OFF");
+}
+
+void updateClientLoraDebug() {
+    if (!loraDebugEnabled) {
+        return;
+    }
+
+    const unsigned long now = millis();
+    if (now - lastLoraDebugPrintMs < 1000) {
+        return;
+    }
+    lastLoraDebugPrintMs = now;
+
+    Serial.print("LoRa debug: tx=");
+    Serial.print(loraTxCount);
+    Serial.print(" rxRaw=");
+    Serial.print(loraRxRawByteCount);
+    Serial.print(" rxFrames=");
+    Serial.print(loraRxFrameCount);
+    Serial.print(" partialLen=");
+    Serial.print(loraLine.length());
+    Serial.print(" overflow=");
+    Serial.print(loraRxOverflowCount);
+    Serial.print(" avail=");
+    Serial.print(Serial1.available());
+    Serial.print(" AUX=");
+    Serial.print(digitalRead(LORA_AUX_PIN));
+    Serial.print(" lastAuxBeforeTx=");
+    Serial.print(lastAuxBeforeTx);
+    Serial.print(" lastAuxAfterTx=");
+    Serial.print(lastAuxAfterTx);
+    Serial.print(" M0=");
+    Serial.print(digitalRead(LORA_M0_PIN));
+    Serial.print(" M1=");
+    Serial.print(digitalRead(LORA_M1_PIN));
+    Serial.println();
+}
+
 void sendLoraLine(const String& text) {
     // 发送前看 AUX，减少在 E22 忙时继续塞 UART 造成的丢字节风险。
     waitForLoraReady();
+    lastAuxBeforeTx = digitalRead(LORA_AUX_PIN);
     // buildFrame 已经带末尾 '\n'，这里不能再 println，否则对端会读到额外空行。
     Serial1.print(text);
+    Serial1.flush();
+    loraTxCount++;
+    lastAuxAfterTx = digitalRead(LORA_AUX_PIN);
     Serial.print("LoRa TX: ");
     Serial.print(text);
 }

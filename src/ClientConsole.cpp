@@ -7,6 +7,7 @@
 
 #include "ClientActions.h"
 #include "ClientDisplay.h"
+#include "ClientLoraLink.h"
 #include "ClientState.h"
 
 namespace {
@@ -142,10 +143,13 @@ void handleSerialCommand() {
                 handleSubmitCommand(&tokens[1], static_cast<uint8_t>(n - 1));
             } else if (tokens[0] == "show") {
                 printClientState();
+            } else if (tokens[0] == "lora-debug") {
+                const bool enabled = !(n >= 2 && tokens[1] == "off");
+                setClientLoraDebugEnabled(enabled);
             } else {
                 Serial.print("Unknown command: ");
                 Serial.println(tokens[0]);
-                Serial.println("Available: submit <red> <blue> / show");
+                Serial.println("Available: submit <red> <blue> / show / lora-debug [on|off]");
             }
 
             continue;

@@ -59,13 +59,14 @@ void setup() {
     sendHello();
 
     Serial.println("E22 UART transparent ready");
-    Serial.println("Serial commands: submit <red 0-99> <blue 0-99> / show");
+    Serial.println("Serial commands: submit <red 0-99> <blue 0-99> / show / lora-debug [on|off]");
 }
 
 void loop() {
     // 先处理 LoRa 入站帧，保证 ACK/ASSIGN/STATUS 尽快生效。
     // 这能降低 pending 提交不必要重传，也能让绑定/解绑尽快刷新显示。
     handleLoraInput();
+    updateClientLoraDebug();
 
     // USB 串口调试命令优先级仅次于 LoRa，便于现场无按键时手工 submit/show。
     handleSerialCommand();
