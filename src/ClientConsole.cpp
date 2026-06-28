@@ -1,5 +1,5 @@
 // 裁判端 USB 串口调试命令实现。
-// 负责解析 submit/show 命令，让未焊按键时也能通过串口提交和查看状态。
+// 负责解析 submit/show/lora-debug 命令，让未焊按键时也能通过串口提交、查看状态和排查 LoRa。
 #include "ClientConsole.h"
 
 #include <Arduino.h>
