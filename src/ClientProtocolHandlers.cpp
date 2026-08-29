@@ -205,8 +205,24 @@ void handleAck(const ScoreProtocol::ParsedFrame& frame) {
     }
 }
 
+void handlePoll(const ScoreProtocol::ParsedFrame& frame) {
+    if (frame.fieldCount != 2) {
+        // POLL,deviceId,CRC。
+        Serial.println("POLL: bad field count, ignored");
+        return;
+    }
+    if (frame.fields[1] != deviceId) {
+        // 忽略发给其他裁判端的 POLL。
+        return;
+    }
+    // 服务端点名，立即上报当前比分/电量/状态。
+    sendHeartbeat();
+    // 重置兜底心跳计时，避免已被轮询到还触发自主心跳。
+    lastHeartbeatMs = millis();
+}
+
 void dispatchFrame(const ScoreProtocol::ParsedFrame& frame) {
-    // 客户端只处理服务端下发的四类消息；HELLO/HEARTBEAT/SUBMIT 这些上行消息忽略。
+    // 客户端只处理服务端下发的消息；HELLO/HEARTBEAT/SUBMIT 这些上行消息忽略。
     switch (frame.type) {
         case ScoreProtocol::MessageType::Status:
             handleStatus(frame);
@@ -219,6 +235,9 @@ void dispatchFrame(const ScoreProtocol::ParsedFrame& frame) {
             break;
         case ScoreProtocol::MessageType::Unbind:
             handleUnbind(frame);
+            break;
+        case ScoreProtocol::MessageType::Poll:
+            handlePoll(frame);
             break;
         default:
             break;

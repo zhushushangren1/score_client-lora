@@ -1,6 +1,14 @@
 // 裁判端 LoRa UART 链路模块实现。
 // 负责 E22 透传串口初始化、按行收发协议帧，以及构造 HELLO/HEARTBEAT/SUBMIT 等上行帧。
+//
+// 收发分离设计：Serial1.flush() 会阻塞（9600 baud 下一帧约 40ms），若在 loop 里直接发送，
+// 按键扫描会被打断、快速连按时丢按钮事件。因此所有 LoRa 发送都投递到一个 FreeRTOS 队列，
+// 由独立的 loraTxTask 真正写 UART；主循环只负责按键/接收/组装帧，按钮保持最高优先级。
 #include "ClientLoraLink.h"
+
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/task.h>
 
 #include <ScoreProtocol.h>
 
@@ -20,9 +28,37 @@ constexpr uint32_t LORA_UART_BAUD = 9600;
 // 单帧最长 120 字节，足够容纳当前 CSV+CRC 协议；超长通常说明串口乱码或丢换行。
 constexpr size_t LORA_LINE_MAX = 120;
 
-// 心跳周期：未锁定时更频繁，已提交锁定后降低通信占用。
-constexpr unsigned long HEARTBEAT_INTERVAL_IDLE_MS = 10000;
-constexpr unsigned long HEARTBEAT_INTERVAL_LOCKED_MS = 15000;
+// 心跳周期：正常情况下客户端由服务端 POLL 驱动上报（见 handlePoll），
+// 自主心跳只作兜底——当服务端停止轮询（重启/异常）时，5s 一次维持在线，
+// 避免被误判离线。锁定后兜底降频到 10 秒。
+constexpr unsigned long HEARTBEAT_INTERVAL_IDLE_MS = 5000;
+constexpr unsigned long HEARTBEAT_INTERVAL_LOCKED_MS = 10000;
+// 兜底心跳附加 0~100ms 随机抖动，用于对抗多台裁判长期运行后晶振漂移导致的相位重聚。
+constexpr unsigned long HEARTBEAT_JITTER_MS = 100;
+// 兜底心跳的相位偏移：client1/2/3 分别错开 0/333/666ms，让三台兜底心跳也不重叠。
+constexpr unsigned long HEARTBEAT_SLOT_OFFSET_MS = 333;
+
+unsigned long heartbeatPhaseOffsetMs() {
+    if (currentClientId == "client2") {
+        return HEARTBEAT_SLOT_OFFSET_MS;
+    }
+    if (currentClientId == "client3") {
+        return HEARTBEAT_SLOT_OFFSET_MS * 2;
+    }
+    return 0;
+}
+
+// 发送队列长度和发送任务栈。队列满时丢弃新帧，丢失由心跳周期上报和 SUBMIT 重传兜底。
+constexpr uint8_t LORA_TX_QUEUE_LENGTH = 8;
+constexpr uint32_t LORA_TX_TASK_STACK = 4096;
+constexpr UBaseType_t LORA_TX_TASK_PRIORITY = 1;
+
+// 队列元素：一帧不含换行的完整文本（含末尾 CRC）。用定长 char 数组跨任务拷贝，避免 String 生命周期问题。
+struct TxFrame {
+    char text[LORA_LINE_MAX + 1];
+};
+
+QueueHandle_t loraTxQueue = nullptr;
 
 String loraLine;
 bool loraDebugEnabled = false;
@@ -36,9 +72,29 @@ int lastAuxAfterTx = -1;
 
 void waitForLoraReady() {
     const unsigned long start = millis();
-    // AUX 为 LOW 表示 E22 正忙。最多等 1 秒，避免硬件异常时主循环永久卡死。
+    // AUX 为 LOW 表示 E22 正忙。最多等 1 秒，避免硬件异常时发送任务永久卡死。
     while (digitalRead(LORA_AUX_PIN) == LOW && millis() - start < 1000) {
         delay(1);
+    }
+}
+
+// 发送任务：从队列取帧并真正写 Serial1。阻塞在这里，不会影响主循环的按键扫描。
+void loraTxTask(void* arg) {
+    (void)arg;
+    TxFrame frame;
+    for (;;) {
+        if (xQueueReceive(loraTxQueue, &frame, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        waitForLoraReady();
+        lastAuxBeforeTx = digitalRead(LORA_AUX_PIN);
+        // buildFrame 已经带末尾 '\n'，这里用 print 而非 println，避免对端读到额外空行。
+        Serial1.print(frame.text);
+        Serial1.flush();
+        loraTxCount++;
+        lastAuxAfterTx = digitalRead(LORA_AUX_PIN);
+        Serial.print("LoRa TX: ");
+        Serial.print(frame.text);
     }
 }
 
@@ -56,6 +112,15 @@ void setupClientLoraLink() {
 
     // Serial1.begin(rx, tx)：这里 RX=GPIO41 接 E22 TXD，TX=GPIO40 接 E22 RXD。
     Serial1.begin(LORA_UART_BAUD, SERIAL_8N1, LORA_RX_PIN, LORA_TX_PIN);
+
+    // 创建发送队列和发送任务，把阻塞的 UART 写移出主循环。
+    if (loraTxQueue == nullptr) {
+        loraTxQueue = xQueueCreate(LORA_TX_QUEUE_LENGTH, sizeof(TxFrame));
+    }
+    if (loraTxQueue != nullptr) {
+        xTaskCreate(loraTxTask, "loraTx", LORA_TX_TASK_STACK, nullptr, LORA_TX_TASK_PRIORITY, nullptr);
+    }
+
     // 模式脚设置后给 E22 一个稳定时间，再开始发 HELLO。
     delay(500);
 }
@@ -139,16 +204,19 @@ void updateClientLoraDebug() {
 }
 
 void sendLoraLine(const String& text) {
-    // 发送前看 AUX，减少在 E22 忙时继续塞 UART 造成的丢字节风险。
-    waitForLoraReady();
-    lastAuxBeforeTx = digitalRead(LORA_AUX_PIN);
-    // buildFrame 已经带末尾 '\n'，这里不能再 println，否则对端会读到额外空行。
-    Serial1.print(text);
-    Serial1.flush();
-    loraTxCount++;
-    lastAuxAfterTx = digitalRead(LORA_AUX_PIN);
-    Serial.print("LoRa TX: ");
-    Serial.print(text);
+    // 只负责把帧投递到发送队列，不在这里写 UART，保证主循环不被 Serial1.flush 阻塞。
+    if (loraTxQueue == nullptr) {
+        return;
+    }
+    TxFrame frame;
+    const size_t len = text.length() < LORA_LINE_MAX ? text.length() : LORA_LINE_MAX;
+    memcpy(frame.text, text.c_str(), len);
+    frame.text[len] = '\0';
+    // 队列满（发送过快）时丢弃，避免阻塞主循环；心跳周期上报和 SUBMIT 重传会兜底。
+    if (xQueueSend(loraTxQueue, &frame, 0) != pdTRUE) {
+        Serial.print("LoRa TX queue full, dropped: ");
+        Serial.println(text);
+    }
 }
 
 void sendHello() {
@@ -166,24 +234,30 @@ void sendHello() {
 void sendHeartbeat() {
     // 心跳 msgId 只用于日志观察，不参与服务端提交去重。
     localHeartbeatMsgId++;
-    // HEARTBEAT 会持续上报 clientId，服务端可据此纠正客户端残留的旧绑定。
+    // HEARTBEAT 同时上报 clientId、电池和当前本地比分，让服务端用同一帧刷新
+    // “在线状态”和“实时比分”，避免额外发 UPDATE 帧增加空中碰撞。
     String fields[] = {
         "HEARTBEAT",
         deviceId,
         currentClientId,
         String(batteryMv),
-        String(localHeartbeatMsgId)
+        String(localHeartbeatMsgId),
+        String(localRed),
+        String(localBlue)
     };
-    sendLoraLine(ScoreProtocol::buildFrame(fields, 5));
+    sendLoraLine(ScoreProtocol::buildFrame(fields, 7));
 }
 
 void sendHeartbeatIfDue() {
-    // 已锁定时降低心跳频率，减少本轮已经提交后的无线占用。
+    // 仅作兜底：服务端正常轮询时，handlePoll 会不断刷新 lastHeartbeatMs，
+    // 这里 5s 周期不会触发。只有服务端停止轮询时才会自主发心跳维持在线。
     const unsigned long interval =
         lockedForCurrentRound ? HEARTBEAT_INTERVAL_LOCKED_MS : HEARTBEAT_INTERVAL_IDLE_MS;
-    if (millis() - lastHeartbeatMs >= interval) {
-        // 先更新时间戳再发送，避免发送过程短暂阻塞导致下一轮循环立即重复发送。
-        lastHeartbeatMs = millis();
+    // 把本机相位折进虚拟时钟：client2/3 的兜底心跳比 client1 分别晚 333/666ms，
+    // 让三台即使在服务端停止轮询后自主上报也保持错开。
+    const unsigned long now = millis() + heartbeatPhaseOffsetMs();
+    if (static_cast<long>(now - lastHeartbeatMs) >= static_cast<long>(interval)) {
+        lastHeartbeatMs = now + random(HEARTBEAT_JITTER_MS + 1);
         sendHeartbeat();
     }
 }
