@@ -46,6 +46,7 @@ void setup() {
     Serial.println(millis());
 
     setupClientLoraLink();   // 必须早于 sendHello()，否则 HELLO 无法通过 E22 发出。
+    ensureClientLoraAirRate(); // 上电自动把 E22 空中速率调到编译期目标值，免去逐台手动 airrate。
     setupClientButtons();    // 只初始化 GPIO，不触发任何业务动作。
     setupClientDisplay();    // 先显示当前绑定/未绑定状态，让上电后立刻有可见反馈。
     setupBatteryMonitor();   // 必须早于 sendHello()，保证 HELLO 携带真实电池电压。

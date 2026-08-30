@@ -60,6 +60,9 @@ struct TxFrame {
 
 QueueHandle_t loraTxQueue = nullptr;
 
+// 配置模式进行期间置位，loraTxTask 看到后会暂停发送，避免把普通帧写进配置模式的 UART。
+volatile bool loraConfigInProgress = false;
+
 String loraLine;
 bool loraDebugEnabled = false;
 unsigned long lastLoraDebugPrintMs = 0;
@@ -85,6 +88,10 @@ void loraTxTask(void* arg) {
     for (;;) {
         if (xQueueReceive(loraTxQueue, &frame, portMAX_DELAY) != pdTRUE) {
             continue;
+        }
+        // 配置模式改写寄存器期间暂停发送，避免普通帧被模块当成配置命令解析。
+        while (loraConfigInProgress) {
+            vTaskDelay(pdMS_TO_TICKS(5));
         }
         waitForLoraReady();
         lastAuxBeforeTx = digitalRead(LORA_AUX_PIN);
@@ -294,4 +301,165 @@ void sendSubmit() {
         String(batteryMv)
     };
     sendLoraLine(ScoreProtocol::buildFrame(fields, 8));
+}
+
+// ---- E22 空中速率配置 ----
+// 与服务端 LoraLink.cpp 中的逻辑一致：进配置模式改写 REG0 寄存器（0x03）低 3 位。
+// 只改空中速率，保留 UART 波特率/校验和地址/信道/功率等其余设置不变。
+
+constexpr uint8_t AIR_RATE_2400 = 0b010;
+constexpr uint8_t AIR_RATE_4800 = 0b011;
+constexpr uint8_t AIR_RATE_9600 = 0b100;
+constexpr uint8_t AIR_RATE_19200 = 0b101;
+constexpr uint8_t AIR_RATE_38400 = 0b110;
+constexpr uint8_t AIR_RATE_62500 = 0b111;
+
+uint8_t airRateBitsFromString(const String& s) {
+    if (s == "2.4") return AIR_RATE_2400;
+    if (s == "4.8") return AIR_RATE_4800;
+    if (s == "9.6") return AIR_RATE_9600;
+    if (s == "19.2") return AIR_RATE_19200;
+    if (s == "38.4") return AIR_RATE_38400;
+    if (s == "62.5") return AIR_RATE_62500;
+    return 0xFF;
+}
+
+const char* airRateName(uint8_t bits) {
+    switch (bits) {
+        case AIR_RATE_2400: return "2.4k";
+        case AIR_RATE_4800: return "4.8k";
+        case AIR_RATE_9600: return "9.6k";
+        case AIR_RATE_19200: return "19.2k";
+        case AIR_RATE_38400: return "38.4k";
+        case AIR_RATE_62500: return "62.5k";
+        default: return "?";
+    }
+}
+
+bool loraConfigWaitAux(unsigned long timeoutMs) {
+    const unsigned long start = millis();
+    while (digitalRead(LORA_AUX_PIN) == LOW && millis() - start < timeoutMs) {
+        delay(1);
+    }
+    return digitalRead(LORA_AUX_PIN) == HIGH;
+}
+
+bool loraConfigReadBytes(uint8_t* buf, uint8_t len, unsigned long timeoutMs) {
+    const unsigned long start = millis();
+    uint8_t got = 0;
+    while (got < len && millis() - start < timeoutMs) {
+        while (got < len && Serial1.available() > 0) {
+            buf[got++] = static_cast<uint8_t>(Serial1.read());
+        }
+        if (got < len) {
+            delay(1);
+        }
+    }
+    return got == len;
+}
+
+bool loraConfigReadSped(uint8_t& sped) {
+    const uint8_t cmd[] = { 0xC1, 0x03, 0x01 };
+    Serial1.write(cmd, sizeof(cmd));
+    Serial1.flush();
+    uint8_t resp[4];
+    if (!loraConfigReadBytes(resp, 4, 300)) {
+        Serial.println("airrate: read SPED timeout");
+        return false;
+    }
+    if (resp[0] != 0xC1 || resp[1] != 0x03 || resp[2] != 0x01) {
+        Serial.println("airrate: read SPED bad response");
+        return false;
+    }
+    sped = resp[3];
+    return true;
+}
+
+bool loraConfigWriteSped(uint8_t sped) {
+    const uint8_t cmd[] = { 0xC2, 0x03, 0x01, sped };
+    Serial1.write(cmd, sizeof(cmd));
+    Serial1.flush();
+    uint8_t resp[4];
+    if (!loraConfigReadBytes(resp, 4, 300)) {
+        Serial.println("airrate: write SPED timeout");
+        return false;
+    }
+    if (resp[0] != 0xC1 || resp[1] != 0x03 || resp[2] != 0x01 || resp[3] != sped) {
+        Serial.println("airrate: write SPED bad response");
+        return false;
+    }
+    return true;
+}
+
+void configureClientLoraAirRate(const String& rateText) {
+    // 置位保护标志，暂停 loraTxTask 发送，避免普通帧被模块当成配置命令。
+    loraConfigInProgress = true;
+
+    // 进配置模式前清空接收缓冲，避免透明模式残留字节干扰响应解析。
+    while (Serial1.available() > 0) {
+        Serial1.read();
+    }
+
+    // 进配置模式：E22-400T22D 配置模式 M1=1、M0=0。
+    digitalWrite(LORA_M0_PIN, LOW);
+    digitalWrite(LORA_M1_PIN, HIGH);
+
+    if (!loraConfigWaitAux(2000)) {
+        Serial.println("airrate: module did not enter config mode (AUX stuck LOW)");
+    } else {
+        delay(10);
+        uint8_t curSped = 0;
+        if (!loraConfigReadSped(curSped)) {
+            // 读失败，不写入，直接回透传。
+        } else {
+            const uint8_t curAir = curSped & 0x07;
+            Serial.print("airrate: current SPED=0x");
+            Serial.print(curSped, HEX);
+            Serial.print(" air=");
+            Serial.println(airRateName(curAir));
+
+            const uint8_t newAir = airRateBitsFromString(rateText);
+            if (rateText.length() == 0) {
+                // 无参数只读当前配置，不写入。
+                Serial.println("airrate: read-only, no change");
+            } else if (newAir == 0xFF) {
+                Serial.println("airrate: unknown rate, use 2.4/4.8/9.6/19.2/38.4/62.5");
+            } else if (newAir == curAir) {
+                Serial.println("airrate: already at target, no change");
+            } else {
+                const uint8_t newSped = (curSped & 0xF8) | newAir;
+                Serial.print("airrate: writing SPED=0x");
+                Serial.print(newSped, HEX);
+                Serial.print(" air=");
+                Serial.println(airRateName(newAir));
+
+                if (!loraConfigWriteSped(newSped)) {
+                    // 写失败。
+                } else {
+                    uint8_t verifySped = 0;
+                    if (loraConfigReadSped(verifySped) && (verifySped & 0x07) == newAir) {
+                        Serial.println("airrate: OK, saved to module flash");
+                    } else {
+                        Serial.println("airrate: verify failed");
+                    }
+                }
+            }
+        }
+    }
+
+    // 回透传模式，并解除发送保护。
+    digitalWrite(LORA_M1_PIN, LOW);
+    digitalWrite(LORA_M0_PIN, LOW);
+    loraConfigInProgress = false;
+    delay(200);
+    Serial.println("airrate: back to transparent mode (power-cycle module if link looks off)");
+}
+
+// 编译期目标空中速率，四台设备（1 服务端 + 3 客户端）必须完全一致。
+// 上电时 ensureClientLoraAirRate() 会把它写入 E22 flash（仅当前值不同时才写）。
+// 注意：首次写入后需断电重启一次，让 SX1268 射频芯片按新速率重新初始化。
+constexpr const char* TARGET_AIR_RATE_KPBS = "19.2";
+
+void ensureClientLoraAirRate() {
+    configureClientLoraAirRate(TARGET_AIR_RATE_KPBS);
 }

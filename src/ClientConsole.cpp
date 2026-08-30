@@ -146,10 +146,13 @@ void handleSerialCommand() {
             } else if (tokens[0] == "lora-debug") {
                 const bool enabled = !(n >= 2 && tokens[1] == "off");
                 setClientLoraDebugEnabled(enabled);
+            } else if (tokens[0] == "airrate") {
+                // airrate <2.4|4.8|9.6|19.2|38.4|62.5>；无参数只读当前配置。
+                configureClientLoraAirRate(n >= 2 ? tokens[1] : "");
             } else {
                 Serial.print("Unknown command: ");
                 Serial.println(tokens[0]);
-                Serial.println("Available: submit <red> <blue> / show / lora-debug [on|off]");
+                Serial.println("Available: submit <red> <blue> / show / lora-debug [on|off] / airrate [kbps]");
             }
 
             continue;

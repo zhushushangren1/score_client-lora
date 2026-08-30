@@ -40,3 +40,14 @@ void sendUnbindAck();
 
 // 发送当前 pending SUBMIT。调用前 pendingRoundId/pendingMsgId/pendingRed/pendingBlue 必须已填好。
 void sendSubmit();
+
+// 改写 E22 空中速率（配置模式写 SPED 寄存器）。
+// rateText：目标空中速率，取值 "2.4"/"4.8"/"9.6"/"19.2"/"38.4"/"62.5"（kbps）；
+//           传空串则只读取并打印当前配置、不写入。
+// 只修改 SPED 低 3 位（空中速率），保留 UART 波特率/校验和地址/信道/功率不变。
+void configureClientLoraAirRate(const String& rateText);
+
+// 上电自动把 E22 空中速率调整到编译期目标值（见 ClientLoraLink.cpp 中 TARGET_AIR_RATE_KPBS）。
+// 与 configureClientLoraAirRate 共用同一套读-比较-写逻辑：当前值不同才写入并保存到 flash。
+// 应在 setupClientLoraLink() 之后、发送任何协议帧之前调用。
+void ensureClientLoraAirRate();
